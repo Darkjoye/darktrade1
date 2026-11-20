@@ -1,29 +1,23 @@
-# DarkTrade demo trading platform
+# DarkTrade — Supabase PostgreSQL edition
 
-A small multi-user web app starter. Every account receives a separate 10,000 USDT virtual wallet. Users can register, sign in, view a simulated market, buy/sell demo assets, and view their holdings and trade history. An admin account can view registered users.
+## GitHub
+Upload all files and folders in this project to the root of your existing `darktrade1` repository, replacing the old versions. The `public` folder must contain `index.html`, `styles.css`, and `app.js`.
 
-## Requirements
-- Node.js 20 or newer
-- npm
+## Supabase database
+In Supabase, open Project Settings → Database → Connection string. Choose URI. Copy the connection string and replace its password placeholder with your database password. If direct connection fails on a hosting provider, use Supabase's Session Pooler URI. Keep this string secret.
 
-## Run locally
-1. Extract this folder.
-2. Copy `.env.example` to `.env`.
-3. Set `SESSION_SECRET` to a long random value (at least 32 characters).
-4. Set `ADMIN_EMAIL` to the email address you will use for your admin account.
-5. Install and start:
+## Render deployment
+Create a Render Web Service from the GitHub repository:
+- Build command: `npm install`
+- Start command: `npm start`
 
-   ```bash
-   npm install
-   npm start
-   ```
+Set environment variables in Render:
+- `NODE_ENV` = `production`
+- `SESSION_SECRET` = a random secret at least 32 characters long
+- `DATABASE_URL` = Supabase PostgreSQL connection string
+- `ADMIN_EMAIL` = your own email address
 
-6. Visit http://localhost:3000 and register using the admin email. That account receives the admin role.
+The server creates its database tables on first startup. Register on DarkTrade with the exact `ADMIN_EMAIL` to receive the admin role.
 
-## Important
-- This is a starter/demo project, not a production-ready financial service.
-- Prices are fixed illustrative values, not live market data.
-- All trades are simulated; there are no deposits, withdrawals, payments, or real exchange connections.
-- Use HTTPS in deployment. Set `NODE_ENV=production`, use a strong secret, and keep the database files private.
-- Before a public launch, add CSRF protection, email verification, password reset, backups, monitoring, stricter security headers, and a proper production database/hosting setup. Have the app security-reviewed.
-- Do not collect real financial deposits or present simulated prices as live prices.
+## Safety
+This is an educational demo starter only. Prices are fixed illustrative values; trades use virtual funds. No deposits, withdrawals, payments or real exchange integration. Before public use, add CSRF protection, email verification, password reset, account lockout, audit logs, backups, monitoring, stricter security headers and an independent security review. Never put database credentials in GitHub or send them in chat.

@@ -1,169 +1,24 @@
-const express = require("express");
-const session = require("express-session");
-const SQLiteStore = require("connect-sqlite3")(session);
-const Database = require("better-sqlite3");
-const bcrypt = require("bcryptjs");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const path = require("path");
-
-const app = express();
-const db = new Database("darktrade.sqlite");
-const PORT = Number(process.env.PORT || 3000);
-const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-
-if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
-  console.error("Set SESSION_SECRET to a random string of at least 32 characters.");
-  process.exit(1);
-}
-
-db.pragma("journal_mode = WAL");
-db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'user',
-  balance REAL NOT NULL DEFAULT 10000,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS holdings (
-  user_id INTEGER NOT NULL,
-  symbol TEXT NOT NULL,
-  quantity REAL NOT NULL DEFAULT 0,
-  PRIMARY KEY(user_id, symbol),
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-CREATE TABLE IF NOT EXISTS trades (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  symbol TEXT NOT NULL,
-  side TEXT NOT NULL,
-  quantity REAL NOT NULL,
-  price REAL NOT NULL,
-  total REAL NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-`);
-
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "20kb" }));
-app.use(express.urlencoded({ extended: false }));
-app.use(session({
-  store: new SQLiteStore({ db: "sessions.sqlite", dir: "." }),
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 1000 * 60 * 60 * 24
-  }
-}));
-
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: "draft-7", legacyHeaders: false });
-const prices = { BTC: 67420.50, ETH: 3245.80, SOL: 182.45, BNB: 615.20 };
-
-function currentUser(req) {
-  if (!req.session.userId) return null;
-  return db.prepare("SELECT id, name, email, role, balance, created_at FROM users WHERE id = ?").get(req.session.userId) || null;
-}
-function requireAuth(req, res, next) {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: "Please sign in first." });
-  req.user = user;
-  next();
-}
-function requireAdmin(req, res, next) {
-  if (req.user.role !== "admin") return res.status(403).json({ error: "Admin access required." });
-  next();
-}
-
-app.use(express.static(path.join(__dirname, "public")));
-
-app.get("/api/market", (_req, res) => {
-  res.json(Object.entries(prices).map(([symbol, price]) => ({ symbol, price, label: symbol + "/USDT" })));
-});
-
-app.post("/api/register", authLimiter, async (req, res) => {
-  const name = String(req.body.name || "").trim().slice(0, 60);
-  const email = String(req.body.email || "").trim().toLowerCase();
-  const password = String(req.body.password || "");
-  if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10) {
-    return res.status(400).json({ error: "Enter a name, valid email, and password with at least 10 characters." });
-  }
-  try {
-    const hash = await bcrypt.hash(password, 12);
-    const role = ADMIN_EMAIL && email === ADMIN_EMAIL ? "admin" : "user";
-    const result = db.prepare("INSERT INTO users (name,email,password_hash,role,balance) VALUES (?,?,?,?,10000)")
-      .run(name, email, hash, role);
-    req.session.userId = Number(result.lastInsertRowid);
-    res.json({ ok: true });
-  } catch (err) {
-    if (String(err.code).includes("SQLITE_CONSTRAINT")) return res.status(409).json({ error: "That email is already registered." });
-    res.status(500).json({ error: "Could not create account." });
-  }
-});
-
-app.post("/api/login", authLimiter, async (req, res) => {
-  const email = String(req.body.email || "").trim().toLowerCase();
-  const password = String(req.body.password || "");
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-    return res.status(401).json({ error: "Email or password is incorrect." });
-  }
-  req.session.userId = user.id;
-  res.json({ ok: true });
-});
-
-app.post("/api/logout", (req, res) => req.session.destroy(() => res.json({ ok: true })));
-
-app.get("/api/me", requireAuth, (req, res) => {
-  const holdings = db.prepare("SELECT symbol, quantity FROM holdings WHERE user_id = ? AND quantity > 0 ORDER BY symbol").all(req.user.id);
-  const trades = db.prepare("SELECT id, symbol, side, quantity, price, total, created_at FROM trades WHERE user_id = ? ORDER BY id DESC LIMIT 30").all(req.user.id);
-  res.json({ user: req.user, holdings, trades, prices });
-});
-
-app.post("/api/trade", requireAuth, (req, res) => {
-  const symbol = String(req.body.symbol || "").toUpperCase();
-  const side = String(req.body.side || "").toLowerCase();
-  const quantity = Number(req.body.quantity);
-  if (!Object.hasOwn(prices, symbol) || !["buy", "sell"].includes(side) || !Number.isFinite(quantity) || quantity <= 0 || quantity > 1e9) {
-    return res.status(400).json({ error: "Invalid demo order." });
-  }
-  const price = prices[symbol];
-  const total = Number((price * quantity).toFixed(2));
-  const transact = db.transaction(() => {
-    const user = db.prepare("SELECT balance FROM users WHERE id = ?").get(req.user.id);
-    const holding = db.prepare("SELECT quantity FROM holdings WHERE user_id = ? AND symbol = ?").get(req.user.id, symbol);
-    const held = holding ? holding.quantity : 0;
-    if (side === "buy" && user.balance < total) throw new Error("Not enough virtual USDT in your demo wallet.");
-    if (side === "sell" && held + 1e-12 < quantity) throw new Error("You do not have enough of this asset to sell.");
-    const nextBalance = side === "buy" ? user.balance - total : user.balance + total;
-    const nextHolding = side === "buy" ? held + quantity : held - quantity;
-    db.prepare("UPDATE users SET balance = ? WHERE id = ?").run(Number(nextBalance.toFixed(2)), req.user.id);
-    db.prepare(`INSERT INTO holdings(user_id,symbol,quantity) VALUES(?,?,?)
-      ON CONFLICT(user_id,symbol) DO UPDATE SET quantity=excluded.quantity`).run(req.user.id, symbol, Math.max(0, nextHolding));
-    db.prepare("INSERT INTO trades(user_id,symbol,side,quantity,price,total) VALUES(?,?,?,?,?,?)")
-      .run(req.user.id, symbol, side, quantity, price, total);
-  });
-  try {
-    transact();
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(400).json({ error: err.message || "Trade failed." });
-  }
-});
-
-app.get("/api/admin", requireAuth, requireAdmin, (_req, res) => {
-  const users = db.prepare("SELECT id,name,email,role,balance,created_at FROM users ORDER BY id DESC LIMIT 200").all();
-  const totals = db.prepare("SELECT COUNT(*) AS users, COALESCE(SUM(balance),0) AS virtual_balance FROM users").get();
-  res.json({ users, totals });
-});
-
-app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
-
-app.listen(PORT, () => console.log(`DarkTrade running at http://localhost:${PORT}`));
+const express=require("express"),session=require("express-session"),PgStore=require("connect-pg-simple")(session),{Pool}=require("pg"),bcrypt=require("bcryptjs"),helmet=require("helmet"),rateLimit=require("express-rate-limit"),path=require("path");
+const app=express(),PORT=process.env.PORT||3000,ADMIN=(process.env.ADMIN_EMAIL||"").trim().toLowerCase();
+if(!process.env.DATABASE_URL||!process.env.SESSION_SECRET||process.env.SESSION_SECRET.length<32){console.error("Set DATABASE_URL and SESSION_SECRET (32+ chars).");process.exit(1);}
+const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==="production"?{rejectUnauthorized:false}:false,max:5});
+const prices={BTC:67420.50,ETH:3245.80,SOL:182.45,BNB:615.20};
+async function init(){await pool.query(`
+CREATE TABLE IF NOT EXISTS dt_users(id BIGSERIAL PRIMARY KEY,name VARCHAR(60) NOT NULL,email VARCHAR(254) UNIQUE NOT NULL,password_hash TEXT NOT NULL,role VARCHAR(10) DEFAULT 'user' CHECK(role IN('user','admin')),balance NUMERIC(18,2) DEFAULT 10000 CHECK(balance>=0),created_at TIMESTAMPTZ DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS dt_holdings(user_id BIGINT REFERENCES dt_users(id) ON DELETE CASCADE,symbol VARCHAR(10),quantity NUMERIC(24,10) DEFAULT 0 CHECK(quantity>=0),PRIMARY KEY(user_id,symbol));
+CREATE TABLE IF NOT EXISTS dt_trades(id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES dt_users(id) ON DELETE CASCADE,symbol VARCHAR(10),side VARCHAR(4) CHECK(side IN('buy','sell')),quantity NUMERIC(24,10),price NUMERIC(18,2),total NUMERIC(18,2),created_at TIMESTAMPTZ DEFAULT NOW());`);}
+app.use(helmet({contentSecurityPolicy:false}));app.use(express.json({limit:"20kb"}));app.set("trust proxy",1);
+app.use(session({store:new PgStore({pool,tableName:"dt_sessions",createTableIfMissing:true}),secret:process.env.SESSION_SECRET,resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:86400000}}));
+const limiter=rateLimit({windowMs:900000,limit:15});
+const auth=(req,res,next)=>req.session.userId?next():res.status(401).json({error:"Please sign in first."});
+const getUser=async id=>(await pool.query("SELECT id,name,email,role,balance,created_at FROM dt_users WHERE id=$1",[id])).rows[0];
+app.use(express.static(path.join(__dirname,"public")));
+app.get("/api/market",(_,res)=>res.json(Object.entries(prices).map(([symbol,price])=>({symbol,price,label:symbol+"/USDT"}))));
+app.post("/api/register",limiter,async(req,res)=>{try{const name=String(req.body.name||"").trim().slice(0,60),email=String(req.body.email||"").trim().toLowerCase(),pw=String(req.body.password||"");if(name.length<2||!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)||pw.length<12)return res.status(400).json({error:"Enter a name, valid email and password of at least 12 characters."});const hash=await bcrypt.hash(pw,12),role=ADMIN&&email===ADMIN?"admin":"user",r=await pool.query("INSERT INTO dt_users(name,email,password_hash,role,balance) VALUES($1,$2,$3,$4,10000) RETURNING id",[name,email,hash,role]);req.session.userId=r.rows[0].id;res.json({ok:true});}catch(e){res.status(e.code==="23505"?409:500).json({error:e.code==="23505"?"Email already registered.":"Could not create account."});}});
+app.post("/api/login",limiter,async(req,res)=>{try{const email=String(req.body.email||"").trim().toLowerCase(),pw=String(req.body.password||""),r=await pool.query("SELECT id,password_hash FROM dt_users WHERE email=$1",[email]),u=r.rows[0];if(!u||!await bcrypt.compare(pw,u.password_hash))return res.status(401).json({error:"Email or password is incorrect."});req.session.regenerate(err=>{if(err)return res.status(500).json({error:"Session error."});req.session.userId=u.id;req.session.save(e=>e?res.status(500).json({error:"Session error."}):res.json({ok:true}));});}catch(e){res.status(500).json({error:"Login unavailable."});}});
+app.post("/api/logout",(req,res)=>req.session.destroy(()=>{res.clearCookie("connect.sid");res.json({ok:true});}));
+app.get("/api/me",auth,async(req,res)=>{try{const user=await getUser(req.session.userId);if(!user)return res.status(401).json({error:"Account not found."});const [h,t]=await Promise.all([pool.query("SELECT symbol,quantity FROM dt_holdings WHERE user_id=$1 AND quantity>0 ORDER BY symbol",[user.id]),pool.query("SELECT id,symbol,side,quantity,price,total,created_at FROM dt_trades WHERE user_id=$1 ORDER BY id DESC LIMIT 30",[user.id])]);res.json({user,holdings:h.rows,trades:t.rows,prices});}catch(e){res.status(500).json({error:"Could not load account."});}});
+app.post("/api/trade",auth,async(req,res)=>{const symbol=String(req.body.symbol||"").toUpperCase(),side=String(req.body.side||"").toLowerCase(),q=Number(req.body.quantity);if(!Object.hasOwn(prices,symbol)||!["buy","sell"].includes(side)||!Number.isFinite(q)||q<=0||q>1e9)return res.status(400).json({error:"Invalid demo order."});const price=prices[symbol],total=Number((price*q).toFixed(2)),c=await pool.connect();try{await c.query("BEGIN");const u=await c.query("SELECT balance FROM dt_users WHERE id=$1 FOR UPDATE",[req.session.userId]);if(!u.rowCount)throw Error("Account not found.");const h=await c.query("SELECT quantity FROM dt_holdings WHERE user_id=$1 AND symbol=$2 FOR UPDATE",[req.session.userId,symbol]),held=h.rowCount?Number(h.rows[0].quantity):0,b=Number(u.rows[0].balance);if(side==="buy"&&b<total)throw Error("Not enough virtual USDT.");if(side==="sell"&&held+1e-10<q)throw Error("Not enough assets to sell.");await c.query("UPDATE dt_users SET balance=$1 WHERE id=$2",[(side==="buy"?b-total:b+total).toFixed(2),req.session.userId]);await c.query("INSERT INTO dt_holdings(user_id,symbol,quantity) VALUES($1,$2,$3) ON CONFLICT(user_id,symbol) DO UPDATE SET quantity=EXCLUDED.quantity",[req.session.userId,symbol,Math.max(0,side==="buy"?held+q:held-q).toFixed(10)]);await c.query("INSERT INTO dt_trades(user_id,symbol,side,quantity,price,total) VALUES($1,$2,$3,$4,$5,$6)",[req.session.userId,symbol,side,q,price,total]);await c.query("COMMIT");res.json({ok:true});}catch(e){await c.query("ROLLBACK");res.status(400).json({error:e.message});}finally{c.release();}});
+app.get("/api/admin",auth,async(req,res)=>{try{const me=await getUser(req.session.userId);if(!me||me.role!=="admin")return res.status(403).json({error:"Admin access required."});const [u,t]=await Promise.all([pool.query("SELECT id,name,email,role,balance,created_at FROM dt_users ORDER BY id DESC LIMIT 200"),pool.query("SELECT COUNT(*) AS users,COALESCE(SUM(balance),0) AS virtual_balance FROM dt_users")]);res.json({users:u.rows,totals:t.rows[0]});}catch(e){res.status(500).json({error:"Admin request failed."});}});
+app.get("*",(_,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
+init().then(()=>app.listen(PORT,()=>console.log("DarkTrade running on "+PORT))).catch(e=>{console.error("Database setup failed:",e.message);process.exit(1);});
